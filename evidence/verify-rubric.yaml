@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 一次 resolve 会冻结父版本顺序、目标数据实例和冲突处理结果，并在重试与重启后复用同一操作。
+  - id: 2
+    type: f2p
+    text: 各目标数据实例可以独立重试，但每项删除结果都只归属于本次 resolve 操作。
+  - id: 3
+    type: f2p
+    text: 全部目标实例完成前不会提交 extension version，也不会生成最终合并节点。
+  - id: 4
+    type: f2p
+    text: 扫描、删除、提交或最终 merge 失败后，重试和进程重启会继续未完成阶段且不重复删除或创建子节点。
+  - id: 5
+    type: f2p
+    text: 重复提交相同 resolve 操作会复用既有进度和已经完成的最终 child。
+  - id: 6
+    type: f2p
+    text: 等待期间父版本、目标实例或相关 repo 状态改变时，陈旧的 resolve 计划会被拒绝提交。
+  - id: 7
+    type: f2p
+    text: 只有全部冲突处理和元数据持久化成功后才返回一个可继续使用的合并版本。
+  - id: 8
+    type: p2p
+    text: 普通 conflict-free merge、未选中的数据实例和既有只读查询保持原行为。

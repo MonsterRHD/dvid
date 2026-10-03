@@ -1,0 +1,14 @@
+project-06｜DVID 冲突消解操作的持久恢复与幂等提交
+题目 ID：janelia-flyem-dvid-f0f4bfe8-c573-44a3-a0cf-af4186e33e33｜Harness：Trae｜有效轮数：572｜完成度：部分完成｜收录：长程题
+关键验证：resolve 专项覆盖扫描、删除、提交、merge、并发和重启；整包 keyvalue 测试在 600 秒超时；审计 datastore/resolve.go
+
+Rubric ID：1｜状态：通过｜期望行为：一次 resolve 会冻结父版本顺序、目标数据实例和冲突处理结果，并在重试与重启后复用同一操作。｜实际观察：冻结计划、分阶段状态、陈旧检查和兼容路径由 resolve 专项测试与调用链验证｜直接证据：resolve 专项覆盖扫描、删除、提交、merge、并发和重启；整包 keyvalue 测试在 600 秒超时；审计 datastore/resolve.go
+Rubric ID：2｜状态：通过｜期望行为：各目标数据实例可以独立重试，但每项删除结果都只归属于本次 resolve 操作。｜实际观察：冻结计划、分阶段状态、陈旧检查和兼容路径由 resolve 专项测试与调用链验证｜直接证据：resolve 专项覆盖扫描、删除、提交、merge、并发和重启；整包 keyvalue 测试在 600 秒超时；审计 datastore/resolve.go
+Rubric ID：3｜状态：通过｜期望行为：全部目标实例完成前不会提交 extension version，也不会生成最终合并节点。｜实际观察：冻结计划、分阶段状态、陈旧检查和兼容路径由 resolve 专项测试与调用链验证｜直接证据：resolve 专项覆盖扫描、删除、提交、merge、并发和重启；整包 keyvalue 测试在 600 秒超时；审计 datastore/resolve.go
+Rubric ID：4｜状态：未通过｜期望行为：扫描、删除、提交或最终 merge 失败后，重试和进程重启会继续未完成阶段且不重复删除或创建子节点。｜实际观察：扩展 UUID 在内存赋值后先创建版本，实例完成前崩溃会从旧记录重新分配扩展并重复删除｜直接证据：datastore/resolve.go resolveExtension 与 runResolve 删除阶段保存顺序｜原因：扩展 UUID 在内存赋值后先创建版本，实例完成前崩溃会从旧记录重新分配扩展并重复删除｜影响：删除阶段崩溃恢复会创建额外子节点并重放已执行删除｜证据位置：datastore/resolve.go resolveExtension 与 runResolve 删除阶段保存顺序
+Rubric ID：5｜状态：通过｜期望行为：重复提交相同 resolve 操作会复用既有进度和已经完成的最终 child。｜实际观察：冻结计划、分阶段状态、陈旧检查和兼容路径由 resolve 专项测试与调用链验证｜直接证据：resolve 专项覆盖扫描、删除、提交、merge、并发和重启；整包 keyvalue 测试在 600 秒超时；审计 datastore/resolve.go
+Rubric ID：6｜状态：通过｜期望行为：等待期间父版本、目标实例或相关 repo 状态改变时，陈旧的 resolve 计划会被拒绝提交。｜实际观察：冻结计划、分阶段状态、陈旧检查和兼容路径由 resolve 专项测试与调用链验证｜直接证据：resolve 专项覆盖扫描、删除、提交、merge、并发和重启；整包 keyvalue 测试在 600 秒超时；审计 datastore/resolve.go
+Rubric ID：7｜状态：未通过｜期望行为：只有全部冲突处理和元数据持久化成功后才返回一个可继续使用的合并版本。｜实际观察：phaseDone 在内存设置后保存失败，下一次同进程请求直接返回 child 而不重新持久化完成状态｜直接证据：datastore/resolve.go runResolve 628-631 与 Resolve phaseDone 分支｜原因：phaseDone 在内存设置后保存失败，下一次同进程请求直接返回 child 而不重新持久化完成状态｜影响：元数据持久化失败后仍能返回可用合并版本成功结果｜证据位置：datastore/resolve.go runResolve 628-631 与 Resolve phaseDone 分支
+Rubric ID：8｜状态：通过｜期望行为：普通 conflict-free merge、未选中的数据实例和既有只读查询保持原行为。｜实际观察：冻结计划、分阶段状态、陈旧检查和兼容路径由 resolve 专项测试与调用链验证｜直接证据：resolve 专项覆盖扫描、删除、提交、merge、并发和重启；整包 keyvalue 测试在 600 秒超时；审计 datastore/resolve.go
+
+Prompt-Rubric 对齐：P1…Pn 与冻结 Rubric 逐项对应，无额外验收要求。

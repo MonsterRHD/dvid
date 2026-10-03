@@ -35,6 +35,19 @@ type TestData struct {
 	*Data
 }
 
+// GobEncode/GobDecode allocate the embedded Data so gob can decode a
+// zero-value TestData (nil embedded pointer) during repo reload.
+func (d *TestData) GobEncode() ([]byte, error) {
+	return d.Data.GobEncode()
+}
+
+func (d *TestData) GobDecode(b []byte) error {
+	if d.Data == nil {
+		d.Data = new(Data)
+	}
+	return d.Data.GobDecode(b)
+}
+
 func (d *TestData) DoRPC(request Request, reply *Response) error {
 	return nil
 }

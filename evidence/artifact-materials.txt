@@ -1,0 +1,1 @@
+已沿真实生产入口审计状态所有者、持久化边界、提交、失败、重试、回滚和清理顺序，并执行无缓存或专项重复验证。resolve 专项覆盖扫描、删除、提交、merge、并发和重启；整包 keyvalue 测试在 600 秒超时；审计 datastore/resolve.go。未通过条目均由代码顺序直接证明，详细触发条件、影响和位置保存在 evidence/rubric-comparison.txt。

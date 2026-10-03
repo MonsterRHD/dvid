@@ -1093,13 +1093,20 @@ func (m *repoManager) deleteRepo(uuid dvid.UUID, passcode string) error {
 		return fmt.Errorf("Unable to delete repo from datastore: %v", err)
 	}
 
-	// Delete all UUIDs in this repo from metadata
+	// Delete all UUIDs in this repo from metadata.  Snapshot the version
+	// list under dag lock rather than ranging it while holding idMutex.
+	r.dag.RLock()
+	allVersions := make([]dvid.VersionID, 0, len(r.dag.nodes))
+	for v := range r.dag.nodes {
+		allVersions = append(allVersions, v)
+	}
+	r.dag.RUnlock()
+
 	m.idMutex.Lock()
 	delete(m.repoToUUID, r.id)
-	for v := range r.dag.nodes {
+	for _, v := range allVersions {
 		u, found := m.versionToUUID[v]
 		if !found {
-			m.idMutex.Unlock()
 			dvid.Errorf("Found version id %d with no corresponding UUID on delete of repo %s!\n", v, uuid)
 			continue
 		}
@@ -1797,32 +1804,68 @@ func (m *repoManager) hideBranch(uuid dvid.UUID, branch string) error {
 	if err != nil {
 		return err
 	}
-	m.repoMutex.Lock()
-	r.Lock()
-	del_set := make(map[dvid.VersionID]struct{})
+
+	// Identify nodes of the branch.  Snapshot the id caches (idMutex) and
+	// read the dag under dag lock; never while holding the other lock.
+	m.idMutex.RLock()
+	uuidByVersion := make(map[dvid.VersionID]dvid.UUID, len(m.versionToUUID))
+	for v, u := range m.versionToUUID {
+		uuidByVersion[v] = u
+	}
+	m.idMutex.RUnlock()
+
+	r.dag.RLock()
+	var toHide []dvid.VersionID
 	for v, node := range r.dag.nodes {
 		if node.branch == branch {
-			del_set[v] = struct{}{}
-			del_uuid := m.versionToUUID[v]
-			delete(m.versionToUUID, v)
-			delete(m.uuidToVersion, del_uuid)
-			delete(r.dag.nodes, v)
-			delete(m.repos, del_uuid)
+			toHide = append(toHide, v)
 		}
 	}
+	r.dag.RUnlock()
+	if len(toHide) == 0 {
+		return fmt.Errorf("branch %q not found", branch)
+	}
+
+	// Delete global metadata with the canonical global order
+	// (idMutex -> repoMutex), matching deleteRepo and repo listings.
+	hidden := make(map[dvid.VersionID]struct{}, len(toHide))
+	m.idMutex.Lock()
+	m.repoMutex.Lock()
+	for _, v := range toHide {
+		u, ok := m.versionToUUID[v]
+		if !ok {
+			u = uuidByVersion[v]
+		}
+		delete(m.versionToUUID, v)
+		delete(m.uuidToVersion, u)
+		delete(m.repos, u)
+		hidden[v] = struct{}{}
+	}
+	m.repoMutex.Unlock()
+	m.idMutex.Unlock()
+
+	// Remove the nodes and repair child lists.  Lock order here is
+	// r.Lock -> dag.Lock -> node.Lock.
+	r.Lock()
+	r.dag.Lock()
+	for _, v := range toHide {
+		delete(r.dag.nodes, v)
+	}
 	for _, node := range r.dag.nodes {
+		node.Lock()
 		var children []dvid.VersionID
 		for _, cv := range node.children {
-			if _, found := del_set[cv]; !found {
+			if _, found := hidden[cv]; !found {
 				children = append(children, cv)
 			}
 		}
 		if len(children) < len(node.children) {
 			node.children = children
 		}
+		node.Unlock()
 	}
+	r.dag.Unlock()
 	r.Unlock()
-	m.repoMutex.Unlock()
 	return r.save()
 }
 
@@ -1995,6 +2038,162 @@ func (m *repoManager) newVersion(parent dvid.UUID, note string, branchname strin
 	return child.uuid, r.save()
 }
 
+// newVersionAssigned creates a child of parent using the given child UUID, or
+// adopts an existing child if a prior attempt partially completed.  Unlike
+// newVersion it tolerates every intermediate crash window:
+//   - child UUID already registered in caches but absent from the DAG:
+//     the existing VersionID is reused and the node is built directly;
+//   - child node already in the DAG: it is verified and returned.
+//
+// This makes node creation idempotent for recoverable operations.
+func (m *repoManager) newVersionAssigned(parent, childUUID dvid.UUID, note, branchname string) (dvid.UUID, error) {
+	if childUUID == dvid.NilUUID {
+		return dvid.NilUUID, fmt.Errorf("can't create assigned version with nil UUID")
+	}
+	r, err := m.repoFromUUID(parent)
+	if err != nil {
+		return dvid.NilUUID, err
+	}
+	parentV, err := m.versionFromUUID(parent)
+	if err != nil {
+		return dvid.NilUUID, err
+	}
+
+	r.RLock()
+	parentNode, found := r.dag.nodes[parentV]
+	r.RUnlock()
+	if !found {
+		return dvid.NilUUID, ErrInvalidVersion
+	}
+	parentNode.RLock()
+	if !parentNode.locked {
+		parentNode.RUnlock()
+		return dvid.NilUUID, ErrBranchUnlockedNode
+	}
+	parentNode.RUnlock()
+
+	// Determine whether the assigned UUID and/or DAG node already exist.
+	var childV dvid.VersionID
+	if v, err := m.versionFromUUID(childUUID); err == nil {
+		childV = v
+		r.RLock()
+		child, nodeFound := r.dag.nodes[childV]
+		r.RUnlock()
+		if nodeFound {
+			// Adopt: verify it's a child of the expected parent.
+			var isChild bool
+			for _, pv := range child.parents {
+				if pv == parentV {
+					isChild = true
+					break
+				}
+			}
+			if !isChild {
+				return dvid.NilUUID, fmt.Errorf("node %s exists but is not a child of parent %s", childUUID, parent)
+			}
+			return childUUID, nil
+		}
+	} else {
+		// Register the assigned UUID, persisting the id caches.
+		m.idMutex.Lock()
+		childV = m.versionID
+		m.versionToUUID[childV] = childUUID
+		m.uuidToVersion[childUUID] = childV
+		m.versionID++
+		m.idMutex.Unlock()
+
+		if err := m.putCaches(); err != nil {
+			return dvid.NilUUID, err
+		}
+		if err := m.putNewIDs(); err != nil {
+			return dvid.NilUUID, err
+		}
+	}
+
+	// Branch uniqueness, mirroring newVersion checks.
+	if branchname == "" || branchname == parentNode.branch {
+		parentNode.RLock()
+		branchname = parentNode.branch
+		for _, sister := range parentNode.children {
+			r.RLock()
+			r.dag.RLock()
+			sisternode, found := r.dag.nodes[sister]
+			r.dag.RUnlock()
+			r.RUnlock()
+			if !found {
+				return dvid.NilUUID, fmt.Errorf("cannot find sibling nodes")
+			}
+			if sisternode.branch == branchname && sisternode.uuid != childUUID {
+				return dvid.NilUUID, ErrBranchUnique
+			}
+		}
+		parentNode.RUnlock()
+	} else {
+		r.RLock()
+		for _, othernode := range r.dag.nodes {
+			if othernode.branch == branchname && othernode.uuid != childUUID {
+				r.RUnlock()
+				return dvid.NilUUID, ErrBranchUnique
+			}
+		}
+		r.RUnlock()
+	}
+
+	// Build and wire the missing child node.
+	child := newNode(childUUID, childV)
+	child.parents = []dvid.VersionID{parentV}
+	child.note = note
+	child.branch = branchname
+
+	m.branchMutex.Lock()
+	if branchname == "" {
+		m.branchToUUID[string(r.uuid)+"master"] = childUUID
+	} else {
+		m.branchToUUID[string(r.uuid)+branchname] = childUUID
+	}
+	m.branchMutex.Unlock()
+
+	m.repoMutex.Lock()
+	m.repos[childUUID] = r
+	m.repoMutex.Unlock()
+
+	parentNode.Lock()
+	var alreadyChild bool
+	for _, cv := range parentNode.children {
+		if cv == childV {
+			alreadyChild = true
+			break
+		}
+	}
+	if !alreadyChild {
+		parentNode.children = append(parentNode.children, childV)
+	}
+	parentNode.updated = time.Now()
+	parentNode.Unlock()
+
+	r.Lock()
+	r.dag.Lock()
+	r.dag.nodes[childV] = child
+	r.dag.Unlock()
+	r.updated = time.Now()
+	r.Unlock()
+
+	// Notify data instances of the new version.
+	r.RLock()
+	for _, dataservice := range r.data {
+		initializer, ok := dataservice.(VersionInitializer)
+		if ok {
+			if err := initializer.InitVersion(childUUID, childV); err != nil {
+				r.RUnlock()
+				return dvid.NilUUID, err
+			}
+		}
+	}
+	r.RUnlock()
+
+	return child.uuid, r.save()
+}
+
 func (m *repoManager) merge(parents []dvid.UUID, note string, mt MergeType) (dvid.UUID, error) {
 	if len(parents) < 2 {
 		return dvid.NilUUID, ErrInvalidUUID
@@ -2021,7 +2220,9 @@ func (m *repoManager) merge(parents []dvid.UUID, note string, mt MergeType) (dvi
 	m.repoMutex.Unlock()
 
 	r.Lock()
+	r.dag.Lock()
 	r.dag.nodes[childV] = child
+	r.dag.Unlock()
 	r.Unlock()
 
 	// Set up pointers with parents
@@ -2088,6 +2289,148 @@ func (m *repoManager) merge(parents []dvid.UUID, note string, mt MergeType) (dvi
 	r.updated = time.Now()
 	r.Unlock()
 	return child.uuid, r.save()
+}
+
+// mergeAssigned performs the final merge of a recoverable operation using a
+// pre-chosen child UUID.  It is idempotent across every crash window:
+//   - child UUID registered in id caches but absent from the DAG: the
+//     existing VersionID is reused and the node is constructed directly;
+//   - child node already in the DAG with the same parent set: adopted;
+//   - otherwise: the UUID is registered, the node built and parents wired.
+//
+// It never creates a second merge node for the same child UUID.
+func (m *repoManager) mergeAssigned(parents []dvid.UUID, childUUID dvid.UUID, note string) error {
+	if len(parents) < 2 {
+		return ErrInvalidUUID
+	}
+	if childUUID == dvid.NilUUID {
+		return fmt.Errorf("can't merge with nil assigned child UUID")
+	}
+
+	m.repoMutex.RLock()
+	r, found := m.repos[parents[0]]
+	m.repoMutex.RUnlock()
+	if !found {
+		return ErrInvalidUUID
+	}
+
+	// Resolve and validate parents: all present, committed, and same repo.
+	parentVs := make([]dvid.VersionID, len(parents))
+	for i, p := range parents {
+		v, err := m.versionFromUUID(p)
+		if err != nil {
+			return err
+		}
+		m.repoMutex.RLock()
+		pRepo, sameRepo := m.repos[p]
+		m.repoMutex.RUnlock()
+		if !sameRepo || pRepo != r {
+			return fmt.Errorf("merge parent %s is not in the same repo", p)
+		}
+		r.dag.RLock()
+		node, nodeFound := r.dag.nodes[v]
+		r.dag.RUnlock()
+		if !nodeFound {
+			return ErrInvalidVersion
+		}
+		node.RLock()
+		locked := node.locked
+		node.RUnlock()
+		if !locked {
+			return ErrBranchUnlockedNode
+		}
+		parentVs[i] = v
+	}
+
+	// Determine the state of the assigned child.
+	var childV dvid.VersionID
+	if v, err := m.versionFromUUID(childUUID); err == nil {
+		childV = v
+		r.dag.RLock()
+		existing, nodeFound := r.dag.nodes[childV]
+		r.dag.RUnlock()
+		if nodeFound {
+			// Adopt only when the existing node has exactly the expected parents.
+			if !sameVersionSet(existing.parents, parentVs) {
+				return fmt.Errorf("merge child %s exists with different parents %v", childUUID, existing.parents)
+			}
+			return nil
+		}
+	} else {
+		// Register the reserved UUID in the id caches.
+		m.idMutex.Lock()
+		childV = m.versionID
+		m.versionToUUID[childV] = childUUID
+		m.uuidToVersion[childUUID] = childV
+		m.versionID++
+		m.idMutex.Unlock()
+
+		if err := m.putCaches(); err != nil {
+			return err
+		}
+		if err := m.putNewIDs(); err != nil {
+			return err
+		}
+	}
+
+	// Build and wire the final merge child.
+	child := newNode(childUUID, childV)
+	child.note = note
+
+	m.repoMutex.Lock()
+	m.repos[childUUID] = r
+	m.repoMutex.Unlock()
+
+	r.Lock()
+	r.dag.Lock()
+	r.dag.nodes[childV] = child
+	r.dag.Unlock()
+	r.Unlock()
+
+	for _, pv := range parentVs {
+		r.dag.RLock()
+		node := r.dag.nodes[pv]
+		r.dag.RUnlock()
+
+		node.Lock()
+		var alreadyParent, alreadyChild bool
+		for _, cpv := range child.parents {
+			if cpv == pv {
+				alreadyParent = true
+			}
+		}
+		for _, cv := range node.children {
+			if cv == childV {
+				alreadyChild = true
+			}
+		}
+		if !alreadyParent {
+			child.parents = append(child.parents, pv)
+		}
+		if !alreadyChild {
+			node.children = append(node.children, childV)
+		}
+		node.updated = time.Now()
+		node.Unlock()
+	}
+
+	// Notify data instances of the new version.
+	r.RLock()
+	for _, dataservice := range r.data {
+		initializer, ok := dataservice.(VersionInitializer)
+		if ok {
+			if err := initializer.InitVersion(childUUID, childV); err != nil {
+				r.RUnlock()
+				return err
+			}
+		}
+	}
+	r.RUnlock()
+
+	r.Lock()
+	r.updated = time.Now()
+	r.Unlock()
+	return r.save()
 }
 
 func (m *repoManager) invalidateAncestors(kvv kvVersions, v dvid.VersionID) error {
@@ -2492,6 +2835,15 @@ type repoT struct {
 	mutCurID   uint64
 	mutSavedID uint64
 	mutMu      sync.RWMutex
+
+	// durable, recoverable resolve operations keyed by stable operation key.
+	// Not exposed via JSON; persisted as a trailing gob field.
+	resolveOps map[string]*resolveOpT
+
+	// In-process coordination for resolve (not persisted).
+	resolveMu      sync.RWMutex
+	resolveCond    *sync.Cond // signaled when an operation finishes
+	resolveRunning map[string]struct{} // operation keys currently executing
 }
 
 // newRepo creates a new repository given a UUID, version, and RepoID,
@@ -2508,6 +2860,7 @@ func newRepo(uuid dvid.UUID, v dvid.VersionID, id dvid.RepoID, passcode string) 
 		log:        []string{},
 		properties: make(map[string]interface{}),
 		data:       make(map[dvid.InstanceName]DataService),
+		resolveOps: make(map[string]*resolveOpT),
 		created:    t,
 		updated:    t,
 	}
@@ -2701,13 +3054,31 @@ func (r *repoT) GobDecode(b []byte) error {
 	if err := dec.Decode(&(r.passcode)); err != nil {
 		r.passcode = ""
 	}
+	// resolveOps may not exist in repos written before this field was added.
+	if err := dec.Decode(&(r.resolveOps)); err != nil {
+		r.resolveOps = nil
+	}
+	if r.resolveOps == nil {
+		r.resolveOps = make(map[string]*resolveOpT)
+	}
 	r.version = r.dag.rootV
 	return nil
 }
 
 func (r *repoT) GobEncode() ([]byte, error) {
-	r.RLock()
-	r.RUnlock()
+	// Synchronize with resolve state: the op map is stable under resolveMu,
+	// each op's fields under its own mu.  Lock order (resolveMu -> op.mu)
+	// matches the protocol used by waiting submissions.
+	r.resolveMu.RLock()
+	defer r.resolveMu.RUnlock()
+	opList := make([]*resolveOpT, 0, len(r.resolveOps))
+	for _, resolveOp := range r.resolveOps {
+		opList = append(opList, resolveOp)
+	}
+	for _, resolveOp := range opList {
+		resolveOp.mu.RLock()
+		defer resolveOp.mu.RUnlock()
+	}
 
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
@@ -2742,6 +3113,9 @@ func (r *repoT) GobEncode() ([]byte, error) {
 		return nil, err
 	}
 	if err := enc.Encode(r.passcode); err != nil {
+		return nil, err
+	}
+	if err := enc.Encode(r.resolveOps); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil

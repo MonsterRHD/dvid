@@ -8,6 +8,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -331,13 +332,24 @@ Repo-Level REST endpoints
  POST /api/repo/{uuid}/resolve
 
 	Forces a merge of a set of committed parent UUIDs into a child by specifying a
-	UUID order that establishes priorities in case of conflicts (see "parents" description
-	below.  
+	UUID order that establishes priorities in case of conflicts (see "parents"
+	description below).
 
-	Unlike the very fast but lazily-enforced 'merge' endpoint, this request spawns an 
-	asynchronous routine that checks all data for the given data instances (see "data" in
-	JSON post), creates versions to delete conflicts, and then performs the conflict-free 
-	merge to a final child.  
+	Unlike the very fast but lazily-enforced 'merge' endpoint, this request checks
+	all data for the given data instances (see "data" in JSON post), creates
+	versions to delete conflicts, and then performs the conflict-free merge to a
+	final child.  The request executes synchronously: the final child is returned
+	only after every conflict deletion, extension commit, and merge has been
+	persisted.
+
+	The whole resolution is frozen into one durable, recoverable operation
+	keyed by the repo, the ordered parents, and the target instance set.  If
+	scanning, deletion, extension commit, or the final merge fails -- including
+	after a process restart -- POSTing the exact same JSON resumes the
+	unfinished phases without duplicate deletions or nodes, and returns the
+	same child.  If the parents, target instances, or repo state changed
+	outside the operation while it was waiting, the stale plan is rejected with
+	a 409 Conflict error and a new plan must be submitted.
 
 	The post body should be JSON of the following format: 
 
@@ -359,7 +371,10 @@ Repo-Level REST endpoints
 
 	{ "child": "3f01a8856" }
 
-	The response includes the UUID of the new merged, child node.
+	The response includes the UUID of the new merged, child node.  A 400 Bad
+	Request indicates malformed input, a 409 Conflict indicates a stale plan
+	or another in-progress resolve, and a 5xx error can be retried with the
+	same request.
 
 
 -------------------------
@@ -2398,18 +2413,13 @@ func repoMergeHandler(c web.C, w http.ResponseWriter, r *http.Request) {
 }
 
 func repoResolveHandler(c web.C, w http.ResponseWriter, r *http.Request) {
-	uuid, _, err := datastore.MatchingUUID(c.URLParams["uuid"])
-	if err != nil {
-		BadRequest(w, r, err)
-		return
-	}
 	if r.Body == nil {
 		BadRequest(w, r, "merge resolving requires JSON to be POSTed per API documentation")
 		return
 	}
 	data, err := io.ReadAll(r.Body)
 	if err != nil {
-		BadRequest(w, r, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -2431,53 +2441,21 @@ func repoResolveHandler(c web.C, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Convert JSON of parents into []UUID and whether we need a child for them to add deletions.
-	numParents := len(jsonData.Parents)
-	oldParents := make([]dvid.UUID, numParents)
-	newParents := make([]dvid.UUID, numParents) // UUID of any parent extension for deletions.
-	for i, uuidFrag := range jsonData.Parents {
-		uuid, _, err := datastore.MatchingUUID(uuidFrag)
-		if err != nil {
-			BadRequest(w, r, fmt.Sprintf("can't match parent %q: %v", uuidFrag, err))
-			return
-		}
-		oldParents[i] = uuid
-		newParents[i] = dvid.NilUUID
-	}
-
-	// Iterate through all k/v for given data instances, making sure we find any conflicts.
-	// If any are found, remove them with first UUIDs taking priority.
-	for _, name := range jsonData.Data {
-		data, err := datastore.GetDataByUUIDName(uuid, name)
-		if err != nil {
-			BadRequest(w, r, err)
-			return
-		}
-
-		if err := datastore.DeleteConflicts(uuid, data, oldParents, newParents); err != nil {
-			BadRequest(w, r, fmt.Errorf("conflict deletion error for data %q: %v", data.DataName(), err))
-			return
-		}
-	}
-
-	// If we have any new nodes with deletions, commit them.
-	for i, oldUUID := range oldParents {
-		if newParents[i] != oldUUID {
-			err := datastore.Commit(newParents[i], "Version for deleting conflicts before merge", nil)
-			if err != nil {
-				BadRequest(w, r, "Error while creating new nodes to handle required deletions: %v", err)
-				return
-			}
-		}
-	}
-
-	// Do the merge
-	mt := datastore.MergeConflictFree
-	newuuid, err := datastore.Merge(newParents, jsonData.Note, mt)
+	// Freeze and execute (or resume) the one durable resolve operation.
+	newuuid, err := datastore.Resolve(dvid.UUID(c.URLParams["uuid"]), jsonData.Data, jsonData.Parents, jsonData.Note)
 	if err != nil {
-		BadRequest(w, r, err)
-	} else {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, "{%q: %q}", "child", newuuid)
+		switch {
+		case errors.Is(err, datastore.ErrResolveBadInput):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		case errors.Is(err, datastore.ErrResolveStale), errors.Is(err, datastore.ErrResolveBusy):
+			http.Error(w, err.Error(), http.StatusConflict)
+		default:
+			// Scan, deletion, commit, or merge failed; the same request may be
+			// retried to resume the operation.
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
 	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, "{%q: %q}", "child", newuuid)
 }

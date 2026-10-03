@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 2,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 3,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 4,
+    "passed": false,
+    "reason": "扩展 UUID 在内存赋值后先创建版本，实例完成前崩溃会从旧记录重新分配扩展并重复删除"
+  },
+  {
+    "id": 5,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 6,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 7,
+    "passed": false,
+    "reason": "phaseDone 在内存设置后保存失败，下一次同进程请求直接返回 child 而不重新持久化完成状态"
+  },
+  {
+    "id": 8,
+    "passed": true,
+    "reason": ""
+  }
+]
