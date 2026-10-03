@@ -27,6 +27,10 @@ import (
 )
 
 type txStats struct {
+	// mu protects all fields below; key-value messages can be handled
+	// concurrently by separate RPC goroutines.
+	mu sync.Mutex
+
 	name string
 	// num key-value pairs
 	numKV uint64
@@ -43,8 +47,12 @@ type txStats struct {
 
 // record stats on size of values
 func (t *txStats) addKV(k, v []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	if t.numKV == 0 {
 		t.firstTime = time.Now()
+		t.lastTime = t.firstTime
 	}
 	t.numKV++
 
@@ -88,6 +96,9 @@ func (t *txStats) addKV(k, v []byte) {
 }
 
 func (t *txStats) printStats() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	dvid.Infof("Total time: %s\n", time.Since(t.firstTime))
 	dvid.Infof("Total size: %s\n", humanize.Bytes(t.totalBytes))
 	dvid.Infof("# kv pairs: %d\n", t.numKV)

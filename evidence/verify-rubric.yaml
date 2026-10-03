@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 终止前 SendKV 全部处理
+  - id: 2
+    type: f2p
+    text: 服务端注册状态在确认后移除
+  - id: 3
+    type: f2p
+    text: 尾部提交结果可观察结果可观察
+  - id: 4
+    type: f2p
+    text: 迟到 KV 返回确定错误
+  - id: 5
+    type: f2p
+    text: 重复终止不重复提交结果可观察
+  - id: 6
+    type: p2p
+    text: 断线保留重试结果结果可观察
+  - id: 7
+    type: p2p
+    text: 空推送及其他类型兼容结果可观察

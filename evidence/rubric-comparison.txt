@@ -1,0 +1,13 @@
+project-04｜DVID 推送会话终止与尾部数据一致性
+题目 ID：janelia-flyem-dvid-4391cc0b-3931-4063-865e-088af210467a｜Harness：Trae｜有效轮数：123｜完成度：部分完成｜收录：长程题
+关键验证：go test -tags 'badger filestore' -count=1 ./rpc ./datastore 通过；审计 rpc/client.go、rpc/server.go、datastore/push_local.go
+
+Rubric ID：1｜状态：通过｜期望行为：终止前 SendKV 全部处理｜实际观察：会话 WaitGroup、终止结果缓存、迟到 KV 拒绝和空推送由 RPC 专项用例验证｜直接证据：go test -tags 'badger filestore' -count=1 ./rpc ./datastore 通过；审计 rpc/client.go、rpc/server.go、datastore/push_local.go
+Rubric ID：2｜状态：通过｜期望行为：服务端注册状态在确认后移除｜实际观察：会话 WaitGroup、终止结果缓存、迟到 KV 拒绝和空推送由 RPC 专项用例验证｜直接证据：go test -tags 'badger filestore' -count=1 ./rpc ./datastore 通过；审计 rpc/client.go、rpc/server.go、datastore/push_local.go
+Rubric ID：3｜状态：通过｜期望行为：尾部提交结果可观察结果可观察｜实际观察：会话 WaitGroup、终止结果缓存、迟到 KV 拒绝和空推送由 RPC 专项用例验证｜直接证据：go test -tags 'badger filestore' -count=1 ./rpc ./datastore 通过；审计 rpc/client.go、rpc/server.go、datastore/push_local.go
+Rubric ID：4｜状态：通过｜期望行为：迟到 KV 返回确定错误｜实际观察：会话 WaitGroup、终止结果缓存、迟到 KV 拒绝和空推送由 RPC 专项用例验证｜直接证据：go test -tags 'badger filestore' -count=1 ./rpc ./datastore 通过；审计 rpc/client.go、rpc/server.go、datastore/push_local.go
+Rubric ID：5｜状态：通过｜期望行为：重复终止不重复提交结果可观察｜实际观察：会话 WaitGroup、终止结果缓存、迟到 KV 拒绝和空推送由 RPC 专项用例验证｜直接证据：go test -tags 'badger filestore' -count=1 ./rpc ./datastore 通过；审计 rpc/client.go、rpc/server.go、datastore/push_local.go
+Rubric ID：6｜状态：未通过｜期望行为：断线保留重试结果结果可观察｜实际观察：服务端发布 addRepo 失败被 closeOnce 永久缓存，重复终止只返回原错误而不重试发布｜直接证据：datastore/push_local.go pusher.Close；rpc/server.go endSession｜原因：服务端发布 addRepo 失败被 closeOnce 永久缓存，重复终止只返回原错误而不重试发布｜影响：连接中断后的相同会话无法通过重复终止完成服务端发布｜证据位置：datastore/push_local.go pusher.Close；rpc/server.go endSession
+Rubric ID：7｜状态：通过｜期望行为：空推送及其他类型兼容结果可观察｜实际观察：会话 WaitGroup、终止结果缓存、迟到 KV 拒绝和空推送由 RPC 专项用例验证｜直接证据：go test -tags 'badger filestore' -count=1 ./rpc ./datastore 通过；审计 rpc/client.go、rpc/server.go、datastore/push_local.go
+
+Prompt-Rubric 对齐：P1…Pn 与冻结 Rubric 逐项对应，无额外验收要求。
