@@ -33,9 +33,12 @@ func (d *Data) getMergeIV(v dvid.VersionID) dvid.InstanceVersion {
 // MergeLabels handles merging of any number of labels throughout the various label data
 // structures.  It assumes that the merges aren't cascading, e.g., there is no attempt
 // to merge label 3 into 4 and also 4 into 5.  The caller should have flattened the merges.
-// TODO: Provide some indication that subset of labels are under evolution, returning
-//   an "unavailable" status or 203 for non-authoritative response.  This might not be
-//   feasible for clustered DVID front-ends due to coordination issues.
+//
+// The merge is performed synchronously so any failure of the underlying writes is
+// returned to the caller.  The merge marker and update flag stay in place on failure,
+// leaving the op retryable: the same merge request can be replayed, and an
+// interrupted merge is continued from the mutation log when the server restarts.
+// ChangeSizeEvent and MergeEndEvent are published only after all RLE writes commit.
 //
 // EVENTS
 //
@@ -46,91 +49,77 @@ func (d *Data) getMergeIV(v dvid.VersionID) dvid.InstanceVersion {
 // labels.MergeEndEvent occurs at end of merge and transmits labels.DeltaMergeEnd struct.
 //
 func (d *Data) MergeLabels(v dvid.VersionID, m labels.MergeOp) error {
+	if len(m.Merged) == 0 {
+		return fmt.Errorf("merge requested without any labels to merge")
+	}
 	dvid.Infof("Merging data %q (labels %s) into label %d ...\n", d.DataName(), m.Merged, m.Target)
 
-	// Mark these labels as dirty until done, and make sure we can actually initiate the merge.
-	if err := labels.MergeStart(d.getMergeIV(v), m); err != nil {
+	// Serialize merges so retries of a pending merge can't race other merge writes.
+	d.mergeMu.Lock()
+	defer d.mergeMu.Unlock()
+
+	iv := d.getMergeIV(v)
+
+	// A previous attempt may have failed after marking the labels, leaving the merge
+	// marker in place so concurrent reads remain consistent. Detecting the identical
+	// in-progress op lets us retry it without double-counting dirty markers.
+	resumed, err := labels.MergeActive(iv, m)
+	if err != nil {
 		return err
 	}
-	d.StartUpdate()
-
-	go func() {
-		if err := labels.LogMerge(d, v, m); err != nil {
-			dvid.Errorf("logging merge %q: %v\n", d.DataName(), err)
+	if !resumed {
+		// Mark these labels as dirty until done, and make sure we can actually initiate the merge.
+		if err := labels.MergeStart(iv, m); err != nil {
+			return err
 		}
-	}()
+		d.StartUpdate()
+	}
 
 	// Signal that we are starting a merge.
 	evt := datastore.SyncEvent{d.DataUUID(), labels.MergeStartEvent}
 	msg := datastore.SyncMessage{labels.MergeStartEvent, v, labels.DeltaMergeStart{m}}
 	if err := datastore.NotifySubscribers(evt, msg); err != nil {
-		d.StopUpdate()
-		return err
+		return fmt.Errorf("can't notify subscribers for event %v: %v", evt, err)
 	}
 
-	// Asynchronously perform merge and handle any concurrent requests using the cache map until
-	// labelvol and labelblk are updated and consistent.
-	go func() {
-		fmt.Printf("Starting merge %v\n", m)
-		d.asyncMergeLabels(v, m)
-		fmt.Printf("Finished merge %v\n", m)
+	// Durably record merge intent before any data is changed so a crash can be
+	// recovered by continuing this merge from the mutation log on restart.
+	if err := labels.LogMerge(d, v, m); err != nil {
+		return fmt.Errorf("can't log merge %s for data %q: %v", m, d.DataName(), err)
+	}
 
-		// Remove dirty labels and updating flag when done.
-		labels.MergeStop(d.getMergeIV(v), m)
-		d.StopUpdate()
-		dvid.Infof("Finished with merge of labels %s.\n", m)
-	}()
-	fmt.Printf("async return from merge on %v\n", m)
-
-	return nil
-}
-
-func (d *Data) asyncMergeLabels(v dvid.VersionID, m labels.MergeOp) {
-	// Get storage objects
-	store, err := datastore.GetOrderedKeyValueDB(d)
+	// Perform all labelvol writes in a single idempotent commit.
+	res, changed, err := d.applyMergeWrites(v, m)
 	if err != nil {
-		dvid.Errorf("Data type labelvol had error initializing store: %v\n", err)
-		return
-	}
-	batcher, ok := store.(storage.KeyValueBatcher)
-	if !ok {
-		dvid.Errorf("Data type labelvol requires batch-enabled store, which %q is not\n", store)
-		return
+		dvid.Criticalf("Merge %s on data %q failed; labels stay marked for retry: %v\n", m, d.DataName(), err)
+		return fmt.Errorf("merge %s failed: %v", m, err)
 	}
 
-	// All blocks that have changed during this merge.  Key = string of block index
-	blocksChanged := make(map[dvid.IZYXString]struct{})
-
-	// Get the block-level RLEs for the toLabel
-	toLabel := m.Target
-	toLabelRLEs, err := d.GetLabelRLEs(v, toLabel)
-	if err != nil {
-		dvid.Criticalf("Can't get block-level RLEs for label %d: %v", toLabel, err)
-		return
+	// Record durable completion of the write phase so recovery can skip this merge.
+	if err := labels.LogMutationComplete(d, v, m.MutID); err != nil {
+		dvid.Criticalf("can't log merge completion for mutid %d on data %q: %v\n", m.MutID, d.DataName(), err)
 	}
-	toLabelSize := toLabelRLEs.NumVoxels()
 
-	// Iterate through all labels to be merged.
-	var addedVoxels uint64
-	for fromLabel := range m.Merged {
-		dvid.Debugf("Merging label %d to label %d...\n", fromLabel, toLabel)
+	if !changed {
+		dvid.Debugf("No changes needed when merging %s into %d.\n", m.Merged, m.Target)
+		labels.MergeStop(iv, m)
+		d.StopUpdate()
+		return nil
+	}
 
-		fromLabelRLEs, err := d.GetLabelRLEs(v, fromLabel)
-		if err != nil {
-			dvid.Errorf("Can't get block-level RLEs for label %d: %v", fromLabel, err)
-			return
-		}
-		fromLabelSize := fromLabelRLEs.NumVoxels()
-		if fromLabelSize == 0 || len(fromLabelRLEs) == 0 {
-			dvid.Debugf("Label %d is empty.  Skipping.\n", fromLabel)
-			continue
-		}
-		addedVoxels += fromLabelSize
+	// All writes committed. Publish block-level merge so synced labelblk instances
+	// relabel their voxel blocks.
+	evt = datastore.SyncEvent{d.DataUUID(), labels.MergeBlockEvent}
+	msg = datastore.SyncMessage{labels.MergeBlockEvent, v, labels.DeltaMerge{MergeOp: m, BlockMap: res.blocksChanged}}
+	if err := datastore.NotifySubscribers(evt, msg); err != nil {
+		dvid.Criticalf("can't notify subscribers for event %v: %v\n", evt, err)
+	}
 
-		// Notify linked labelsz instances
+	// Notify linked labelsz instances of each integrated source label deletion.
+	for fromLabel, oldSize := range res.deletedSizes {
 		delta := labels.DeltaDeleteSize{
 			Label:    fromLabel,
-			OldSize:  fromLabelSize,
+			OldSize:  oldSize,
 			OldKnown: true,
 		}
 		evt := datastore.SyncEvent{d.DataUUID(), labels.ChangeSizeEvent}
@@ -138,13 +127,89 @@ func (d *Data) asyncMergeLabels(v dvid.VersionID, m labels.MergeOp) {
 		if err := datastore.NotifySubscribers(evt, msg); err != nil {
 			dvid.Criticalf("can't notify subscribers for event %v: %v\n", evt, err)
 		}
+	}
 
-		// Append or insert RLE runs from fromLabel blocks into toLabel blocks.
+	delta := labels.DeltaReplaceSize{
+		Label:   m.Target,
+		OldSize: res.toLabelSize,
+		NewSize: res.toLabelSize + res.addedVoxels,
+	}
+	evt = datastore.SyncEvent{d.DataUUID(), labels.ChangeSizeEvent}
+	msg = datastore.SyncMessage{labels.ChangeSizeEvent, v, delta}
+	if err := datastore.NotifySubscribers(evt, msg); err != nil {
+		dvid.Criticalf("can't notify subscribers for event %v: %v\n", evt, err)
+	}
+
+	evt = datastore.SyncEvent{d.DataUUID(), labels.MergeEndEvent}
+	msg = datastore.SyncMessage{labels.MergeEndEvent, v, labels.DeltaMergeEnd{m}}
+	if err := datastore.NotifySubscribers(evt, msg); err != nil {
+		dvid.Criticalf("can't notify subscribers for event %v: %v\n", evt, err)
+	}
+
+	// Reached consistent terminal state: clear merge marker and update flag.
+	labels.MergeStop(iv, m)
+	d.StopUpdate()
+	dvid.Infof("Finished merge of %s into label %d on data %q.\n", m.Merged, m.Target, d.DataName())
+	return nil
+}
+
+// mergeWrites holds the results of applying a merge to labelvol RLE storage,
+// including the metadata needed to publish post-commit size events.
+type mergeWrites struct {
+	blocksChanged map[dvid.IZYXString]struct{}
+	toLabelSize   uint64
+	addedVoxels   uint64
+	deletedSizes  map[uint64]uint64
+}
+
+// applyMergeWrites performs the idempotent read/merge/delete/write of labelvol RLEs
+// for the given merge op, committing target block puts and source block deletes in a
+// single batch. Target blocks are staged before source deletes so a partially applied
+// batch can never leave source voxels removed without the target holding them. It is
+// safe to re-run after a partially completed attempt or during crash recovery.
+func (d *Data) applyMergeWrites(v dvid.VersionID, m labels.MergeOp) (mw mergeWrites, changed bool, err error) {
+	store, err := datastore.GetOrderedKeyValueDB(d)
+	if err != nil {
+		return mw, false, fmt.Errorf("data type labelvol had error initializing store: %v", err)
+	}
+	batcher, ok := store.(storage.KeyValueBatcher)
+	if !ok {
+		return mw, false, fmt.Errorf("data type labelvol requires batch-enabled store, which %q is not", store)
+	}
+
+	toLabel := m.Target
+	toLabelRLEs, err := d.GetLabelRLEs(v, toLabel)
+	if err != nil {
+		return mw, false, fmt.Errorf("can't get block-level RLEs for label %d: %v", toLabel, err)
+	}
+	mw.toLabelSize = toLabelRLEs.NumVoxels()
+	mw.blocksChanged = make(map[dvid.IZYXString]struct{})
+	mw.deletedSizes = make(map[uint64]uint64)
+
+	// Blocks to remove per integrated source label.
+	srcBlocks := make(map[uint64][]dvid.IZYXString, len(m.Merged))
+
+	for fromLabel := range m.Merged {
+		dvid.Debugf("Merging label %d to label %d...\n", fromLabel, toLabel)
+
+		fromLabelRLEs, err := d.GetLabelRLEs(v, fromLabel)
+		if err != nil {
+			return mw, false, fmt.Errorf("can't get block-level RLEs for label %d: %v", fromLabel, err)
+		}
+		fromLabelSize := fromLabelRLEs.NumVoxels()
+		if fromLabelSize == 0 || len(fromLabelRLEs) == 0 {
+			dvid.Debugf("Label %d is empty.  Skipping.\n", fromLabel)
+			continue
+		}
+		mw.addedVoxels += fromLabelSize
+		mw.deletedSizes[fromLabel] = fromLabelSize
+
+		blocks := make([]dvid.IZYXString, 0, len(fromLabelRLEs))
 		for blockStr, fromRLEs := range fromLabelRLEs {
-			// Mark the fromLabel blocks as modified
-			blocksChanged[blockStr] = struct{}{}
+			mw.blocksChanged[blockStr] = struct{}{}
+			blocks = append(blocks, blockStr)
 
-			// Get the toLabel RLEs for this block and add the fromLabel RLEs
+			// Integrate the fromLabel RLEs into the toLabel RLEs for this block.
 			toRLEs, found := toLabelRLEs[blockStr]
 			if found {
 				toRLEs.Add(fromRLEs)
@@ -153,60 +218,114 @@ func (d *Data) asyncMergeLabels(v dvid.VersionID, m labels.MergeOp) {
 			}
 			toLabelRLEs[blockStr] = toRLEs
 		}
-
-		// Delete all fromLabel RLEs since they are all integrated into toLabel RLEs
-		minTKey := NewTKey(fromLabel, dvid.MinIndexZYX.ToIZYXString())
-		maxTKey := NewTKey(fromLabel, dvid.MaxIndexZYX.ToIZYXString())
-		ctx := datastore.NewVersionedCtx(d, v)
-		fmt.Printf("Deleting all versions of label %d, key %v to %v\n", fromLabel, minTKey, maxTKey)
-		if err := store.DeleteRange(ctx, minTKey, maxTKey); err != nil {
-			dvid.Criticalf("Can't delete label %d RLEs: %v", fromLabel, err)
-		}
+		srcBlocks[fromLabel] = blocks
 	}
 
-	if len(blocksChanged) == 0 {
-		dvid.Debugf("No changes needed when merging %s into %d.  Aborting.\n", m.Merged, m.Target)
-		return
+	if len(mw.blocksChanged) == 0 {
+		return mw, false, nil
 	}
 
-	// Publish block-level merge
-	evt := datastore.SyncEvent{d.DataUUID(), labels.MergeBlockEvent}
-	msg := datastore.SyncMessage{labels.MergeBlockEvent, v, labels.DeltaMerge{MergeOp: m, BlockMap: blocksChanged}}
-	if err := datastore.NotifySubscribers(evt, msg); err != nil {
-		dvid.Errorf("can't notify subscribers for event %v: %v\n", evt, err)
-	}
-
-	// Update datastore with all toLabel RLEs that were changed
 	ctx := datastore.NewVersionedCtx(d, v)
 	batch := batcher.NewBatch(ctx)
-	for blockStr := range blocksChanged {
-		tk := NewTKey(toLabel, blockStr)
+
+	// Stage the merged target blocks first.
+	for blockStr := range mw.blocksChanged {
 		serialization, err := toLabelRLEs[blockStr].MarshalBinary()
 		if err != nil {
-			dvid.Errorf("Error serializing RLEs for label %d: %v\n", toLabel, err)
+			return mw, true, fmt.Errorf("error serializing RLEs for label %d: %v", toLabel, err)
 		}
-		fmt.Printf("Updating new merged key %v\n", tk)
-		batch.Put(tk, serialization)
-	}
-	if err := batch.Commit(); err != nil {
-		dvid.Errorf("Error on updating RLEs for label %d: %v\n", toLabel, err)
-	}
-	delta := labels.DeltaReplaceSize{
-		Label:   toLabel,
-		OldSize: toLabelSize,
-		NewSize: toLabelSize + addedVoxels,
-	}
-	evt = datastore.SyncEvent{d.DataUUID(), labels.ChangeSizeEvent}
-	msg = datastore.SyncMessage{labels.ChangeSizeEvent, v, delta}
-	if err := datastore.NotifySubscribers(evt, msg); err != nil {
-		dvid.Errorf("can't notify subscribers for event %v: %v\n", evt, err)
+		batch.Put(NewTKey(toLabel, blockStr), serialization)
 	}
 
-	evt = datastore.SyncEvent{d.DataUUID(), labels.MergeEndEvent}
-	msg = datastore.SyncMessage{labels.MergeEndEvent, v, labels.DeltaMergeEnd{m}}
-	if err := datastore.NotifySubscribers(evt, msg); err != nil {
-		dvid.Errorf("can't notify subscribers for event %v: %v\n", evt, err)
+	// Stage deletion of all integrated source blocks in the same batch. A label
+	// merged into itself keeps its blocks through the puts above.
+	for fromLabel, blocks := range srcBlocks {
+		if fromLabel == toLabel {
+			continue
+		}
+		for _, blockStr := range blocks {
+			batch.Delete(NewTKey(fromLabel, blockStr))
+		}
 	}
+
+	if err := batch.Commit(); err != nil {
+		return mw, true, fmt.Errorf("can't commit merged RLEs into label %d: %v", toLabel, err)
+	}
+	return mw, true, nil
+}
+
+// recoverPendingMerges continues merges found in the mutation log without a
+// completion marker, e.g., merges interrupted by a process crash. Merge application
+// is idempotent: already-applied merges converge without change. It is invoked at
+// instance initialization before sync events are served.
+func (d *Data) recoverPendingMerges() {
+	rl := d.GetReadLog()
+	if rl == nil {
+		return
+	}
+	rootV, err := d.RootVersionID()
+	if err != nil {
+		dvid.Errorf("Can't get root version for merge recovery of data %q: %v\n", d.DataName(), err)
+		return
+	}
+	versions, err := versionSubtree(rootV)
+	if err != nil {
+		dvid.Errorf("Can't enumerate versions for merge recovery of data %q: %v\n", d.DataName(), err)
+		return
+	}
+	for _, v := range versions {
+		if err := d.recoverVersionMerges(v); err != nil {
+			dvid.Criticalf("Merge recovery failed for data %q: %v\n", d.DataName(), err)
+		}
+	}
+}
+
+// versionSubtree returns the root and all descendant versions, parents before
+// children, so merge logs are continued in causal order.
+func versionSubtree(root dvid.VersionID) ([]dvid.VersionID, error) {
+	var all []dvid.VersionID
+	stack := []dvid.VersionID{root}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		all = append(all, cur)
+		children, err := datastore.GetChildrenByVersion(cur)
+		if err != nil {
+			return nil, err
+		}
+		stack = append(stack, children...)
+	}
+	return all, nil
+}
+
+// recoverVersionMerges continues all incomplete merge ops logged for one version.
+func (d *Data) recoverVersionMerges(v dvid.VersionID) error {
+	ops, complete, err := labels.ReadMergeLog(d, v)
+	if err != nil {
+		return err
+	}
+	uuid, err := datastore.UUIDFromVersion(v)
+	if err != nil {
+		return err
+	}
+	for _, op := range ops {
+		if _, done := complete[op.MutID]; done {
+			continue
+		}
+		_, changed, err := d.applyMergeWrites(v, op)
+		if err != nil {
+			return fmt.Errorf("can't continue merge %s (mutid %d) at version %s: %v", op, op.MutID, uuid, err)
+		}
+		// Mark the op satisfied whether we wrote changes now or found it already
+		// converged, preventing later label recreation from being re-merged.
+		if lerr := labels.LogMutationComplete(d, v, op.MutID); lerr != nil {
+			dvid.Criticalf("can't log recovered merge completion (mutid %d) for data %q: %v\n", op.MutID, d.DataName(), lerr)
+		}
+		if changed {
+			dvid.Infof("Continued interrupted merge %s (mutid %d) for data %q\n", op, op.MutID, d.DataName())
+		}
+	}
+	return nil
 }
 
 // SplitLabels splits a portion of a label's voxels into a given split label or, if the given split

@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/janelia-flyem/dvid/datastore"
+	"github.com/janelia-flyem/dvid/datatype/common/labels"
 	"github.com/janelia-flyem/dvid/dvid"
 	"github.com/janelia-flyem/dvid/server"
 
@@ -561,6 +562,110 @@ func TestMergeLabels(t *testing.T) {
 	if err := retrieved.equals(expected); err != nil {
 		t.Errorf("Merged label volume: %v\n", err)
 	}
+}
+
+// TestMergeRecovery simulates a crash between durable merge intent logging and the
+// RLE writes, then verifies that after a process restart the merge is continued
+// from the mutation log, marked complete, and stays idempotent across restarts.
+func TestMergeRecovery(t *testing.T) {
+	if err := server.OpenTest(); err != nil {
+		t.Fatalf("can't open test server: %v\n", err)
+	}
+	defer server.CloseTest()
+
+	// Create testbed volume and data instances
+	uuid, _ := initTestRepo()
+	var config dvid.Config
+	server.CreateTestInstance(t, uuid, "labelblk", "labels", config)
+	server.CreateTestInstance(t, uuid, "labelvol", "bodies", config)
+	server.CreateTestSync(t, uuid, "labels", "bodies")
+	server.CreateTestSync(t, uuid, "bodies", "labels")
+
+	createLabelTestVolume(t, uuid, "labels")
+	if err := datastore.BlockOnUpdating(uuid, "bodies"); err != nil {
+		t.Fatalf("Error blocking on sync of labels -> bodies: %v\n", err)
+	}
+
+	d, err := GetByUUIDName(uuid, "bodies")
+	if err != nil {
+		t.Fatalf("Unable to get labelvol data pointer: %v\n", err)
+	}
+	v, err := datastore.VersionFromUUID(uuid)
+	if err != nil {
+		t.Fatalf("bad version from UUID %s: %v\n", uuid, err)
+	}
+
+	// Label 3 should be present before the simulated crash.
+	req3 := fmt.Sprintf("%snode/%s/%s/sparsevol/%d", server.WebAPIPath, uuid, "bodies", 3)
+	server.TestHTTP(t, "GET", req3, nil)
+
+	// Simulate a crash right after the merge intent was durably logged but before
+	// any labelvol RLEs were written.
+	const pendingMutID = uint64(123456789)
+	pendingMerge := labels.MergeOp{
+		MutID:  pendingMutID,
+		Target: 2,
+		Merged: labels.NewSet(3),
+	}
+	if err := labels.LogMerge(d, v, pendingMerge); err != nil {
+		t.Fatalf("can't write pending merge to mutation log: %v\n", err)
+	}
+
+	// Restart the datastore as if the process crashed and recovered.
+	datastore.CloseReopenTest()
+
+	d2, err := GetByUUIDName(uuid, "bodies")
+	if err != nil {
+		t.Fatalf("can't get reloaded labelvol data: %v\n", err)
+	}
+	v2, err := datastore.VersionFromUUID(uuid)
+	if err != nil {
+		t.Fatalf("bad version from UUID %s after reopen: %v\n", uuid, err)
+	}
+
+	// Recovery should have continued the merge: label 3 sparsevol is gone.
+	server.TestBadHTTP(t, "GET", req3, nil)
+
+	// Label 2 should now hold the union of body2 and body3.
+	req2 := fmt.Sprintf("%snode/%s/%s/sparsevol/%d", server.WebAPIPath, uuid, "bodies", 2)
+	encoding := server.TestHTTP(t, "GET", req2, nil)
+	recoveredBody2 := body2
+	recoveredBody2.voxelSpans = append(append([]dvid.Span{}, body2.voxelSpans...), body3.voxelSpans...)
+	recoveredBody2.checkSparseVol(t, encoding, dvid.OptionalBounds{})
+
+	// An untouched label should be unchanged.
+	req1 := fmt.Sprintf("%snode/%s/%s/sparsevol/%d", server.WebAPIPath, uuid, "bodies", 1)
+	encoding = server.TestHTTP(t, "GET", req1, nil)
+	body1.checkSparseVol(t, encoding, dvid.OptionalBounds{})
+
+	// The mutation log should now carry a completion marker for the merge.
+	ops, complete, err := labels.ReadMergeLog(d2, v2)
+	if err != nil {
+		t.Fatalf("can't read merge log after recovery: %v\n", err)
+	}
+	if len(ops) != 1 || ops[0].MutID != pendingMutID || ops[0].Target != 2 {
+		t.Fatalf("expected single pending merge op (mutid %d, target 2), got %v\n", pendingMutID, ops)
+	}
+	if _, done := complete[pendingMutID]; !done {
+		t.Fatalf("merge mutid %d should be marked complete after recovery\n", pendingMutID)
+	}
+
+	// A second restart must not re-apply the finished merge.
+	datastore.CloseReopenTest()
+	server.TestBadHTTP(t, "GET", fmt.Sprintf("%snode/%s/%s/sparsevol/%d", server.WebAPIPath, uuid, "bodies", 3), nil)
+	encoding = server.TestHTTP(t, "GET", req2, nil)
+	recoveredBody2.checkSparseVol(t, encoding, dvid.OptionalBounds{})
+
+	// Normal merges still work after recovery, including synced labelblk relabeling.
+	mergeJSON(`[4, 1]`).send(t, uuid, "bodies")
+	if err := datastore.BlockOnUpdating(uuid, "labels"); err != nil {
+		t.Fatalf("Error blocking on sync of bodies -> labels: %v\n", err)
+	}
+	server.TestBadHTTP(t, "GET", req1, nil)
+	encoding = server.TestHTTP(t, "GET", fmt.Sprintf("%snode/%s/%s/sparsevol/%d", server.WebAPIPath, uuid, "bodies", 4), nil)
+	mergedBody4 := body4
+	mergedBody4.voxelSpans = append(append([]dvid.Span{}, body4.voxelSpans...), body1.voxelSpans...)
+	mergedBody4.checkSparseVol(t, encoding, dvid.OptionalBounds{})
 }
 
 func TestSplitLabel(t *testing.T) {

@@ -27,6 +27,10 @@ func (d *Data) InitDataHandlers() error {
 	if d.syncCh != nil || d.syncDone != nil {
 		return nil
 	}
+
+	// Continue any merges interrupted by a previous shutdown before serving events.
+	d.recoverPendingMerges()
+
 	d.syncCh = make(chan datastore.SyncMessage, syncBufferSize)
 	d.syncDone = make(chan *sync.WaitGroup)
 

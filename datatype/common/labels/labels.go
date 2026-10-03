@@ -86,6 +86,39 @@ func MergeStop(iv dvid.InstanceVersion, op MergeOp) {
 	}
 }
 
+// MergeActive checks whether an identical merge op is already registered for the
+// given instance version. It returns true if every label in op.Merged currently
+// maps to op.Target, which indicates a retry of a merge that was started but did
+// not reach its terminal state. It returns false when none of the merged labels are
+// tracked. An error is returned if any involved label is tracked under a
+// conflicting merge, e.g., merging into a target that is itself merging away.
+func MergeActive(iv dvid.InstanceVersion, op MergeOp) (bool, error) {
+	mc.RLock()
+	mapping := mc.m[iv]
+	mc.RUnlock()
+	if mapping == nil {
+		return false, nil
+	}
+	if mapped, found := mapping.FinalLabel(op.Target); found && mapped != op.Target {
+		return false, fmt.Errorf("can't merge into label %d while it is currently merging into label %d", op.Target, mapped)
+	}
+	anyTracked := false
+	for label := range op.Merged {
+		mapped, found := mapping.Get(label)
+		if !found {
+			if anyTracked {
+				return false, fmt.Errorf("merge %s is partially registered for %s; can't retry", op.Merged, iv)
+			}
+			continue
+		}
+		if mapped != op.Target {
+			return false, fmt.Errorf("can't merge label %d into %d while it is currently merging into label %d", label, op.Target, mapped)
+		}
+		anyTracked = true
+	}
+	return anyTracked, nil
+}
+
 // SplitStart checks current label map to see if the split conflicts.
 func SplitStart(iv dvid.InstanceVersion, op DeltaSplitStart) error {
 	if labelsMerging.IsDirty(iv, op.NewLabel) {

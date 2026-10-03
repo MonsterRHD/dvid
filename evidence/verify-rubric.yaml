@@ -1,0 +1,22 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 读取失败阻止成功结果结果可观察
+  - id: 2
+    type: f2p
+    text: 源块删除失败保留重试状态
+  - id: 3
+    type: f2p
+    text: batch.Commit 失败不发布完成
+  - id: 4
+    type: f2p
+    text: HTTP 返回与后台终态一致
+  - id: 5
+    type: f2p
+    text: MergeStop 不提前清除状态
+  - id: 6
+    type: p2p
+    text: 尺寸事件仅在成功后发布结果可观察
+  - id: 7
+    type: p2p
+    text: 重启按 mutation log 继续或回滚

@@ -3,6 +3,9 @@
 package labels
 
 import (
+	"encoding/binary"
+	"fmt"
+
 	pb "google.golang.org/protobuf/proto"
 
 	"github.com/janelia-flyem/dvid/datastore"
@@ -10,6 +13,17 @@ import (
 	"github.com/janelia-flyem/dvid/dvid"
 	"github.com/janelia-flyem/dvid/storage"
 )
+
+// mergeLogWritable provides a write log without requiring it, allowing data types
+// like labelvol that embed the base datastore.Data to durably log merges whenever
+// a log store happens to be configured.
+type mergeLogWritable interface {
+	GetWriteLog() storage.WriteLog
+}
+
+type mergeLogReadable interface {
+	GetReadLog() storage.ReadLog
+}
 
 // LogSplit logs the split of a set of voxels from the underlying label.
 func LogSplit(d dvid.Data, v dvid.VersionID, op SplitOp) error {
@@ -69,7 +83,7 @@ func LogMerge(d dvid.Data, v dvid.VersionID, op MergeOp) error {
 	if err != nil {
 		return err
 	}
-	logable, ok := d.(storage.LogWritable)
+	logable, ok := d.(mergeLogWritable)
 	if !ok {
 		return nil // skip logging
 	}
@@ -83,6 +97,77 @@ func LogMerge(d dvid.Data, v dvid.VersionID, op MergeOp) error {
 	}
 	msg := storage.LogMessage{EntryType: proto.MergeOpType, Data: data}
 	return log.Append(d.DataUUID(), uuid, msg)
+}
+
+// LogMutationComplete records that all data writes for the mutation with the given
+// ID have committed. Paired with the merge op entry, it forms a durable record of
+// the merge terminal state, allowing crash recovery to skip finished mutations.
+func LogMutationComplete(d dvid.Data, v dvid.VersionID, mutID uint64) error {
+	uuid, err := datastore.UUIDFromVersion(v)
+	if err != nil {
+		return err
+	}
+	logable, ok := d.(mergeLogWritable)
+	if !ok {
+		return nil // skip logging
+	}
+	log := logable.GetWriteLog()
+	if log == nil {
+		return nil
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], mutID)
+	msg := storage.LogMessage{EntryType: proto.MutationCompleteType, Data: buf[:]}
+	return log.Append(d.DataUUID(), uuid, msg)
+}
+
+// ReadMergeLog reads the mutation log for a version of the given data and returns
+// the logged merge ops in append order along with the set of mutation IDs that have
+// a completion marker. Merge ops without a completion marker may have been
+// interrupted by a crash and should be continued (re-applied idempotently) during
+// recovery. A nil log store yields nil slices and no error.
+func ReadMergeLog(d dvid.Data, v dvid.VersionID) (ops []MergeOp, complete map[uint64]struct{}, err error) {
+	uuid, err := datastore.UUIDFromVersion(v)
+	if err != nil {
+		return nil, nil, err
+	}
+	logreadable, ok := d.(mergeLogReadable)
+	if !ok {
+		return nil, nil, nil
+	}
+	rl := logreadable.GetReadLog()
+	if rl == nil {
+		return nil, nil, nil
+	}
+	msgs, err := rl.ReadAll(d.DataUUID(), uuid)
+	if err != nil {
+		return nil, nil, err
+	}
+	complete = make(map[uint64]struct{})
+	for _, msg := range msgs {
+		switch msg.EntryType {
+		case proto.MergeOpType:
+			var pop proto.MergeOp
+			if err := pb.Unmarshal(msg.Data, &pop); err != nil {
+				return nil, nil, fmt.Errorf("unable to unmarshal merge log entry for data %q: %v", d.DataName(), err)
+			}
+			op := MergeOp{
+				MutID:  pop.Mutid,
+				Target: pop.Target,
+				Merged: make(Set, len(pop.Merged)),
+			}
+			for _, label := range pop.Merged {
+				op.Merged[label] = struct{}{}
+			}
+			ops = append(ops, op)
+		case proto.MutationCompleteType:
+			if len(msg.Data) < 8 {
+				return nil, nil, fmt.Errorf("malformed mutation completion marker for data %q: got %d bytes, need 8", d.DataName(), len(msg.Data))
+			}
+			complete[binary.BigEndian.Uint64(msg.Data[:8])] = struct{}{}
+		}
+	}
+	return ops, complete, nil
 }
 
 // LogRenumber logs the merge of supervoxels to a label.

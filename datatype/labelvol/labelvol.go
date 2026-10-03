@@ -586,6 +586,10 @@ type Data struct {
 	// channels for mutations and downres caching.
 	syncCh   chan datastore.SyncMessage
 	syncDone chan *sync.WaitGroup
+
+	// mergeMu serializes merge operations on this instance so a retried merge can't
+	// race the write phase of another in-progress merge.
+	mergeMu sync.Mutex
 }
 
 // RemapVersions modifies internal data instance properties that rely
